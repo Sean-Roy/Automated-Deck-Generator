@@ -1,76 +1,126 @@
+from __future__ import annotations
 import pandas as pd
+from typing import List, Tuple
 
 
-class DataCleaner():
-    def __init__(self):
-        self.key_columns = ['Core_Groups', 'Groups', 'Sub_Groups', 'Value_Type', 'Reporting_Period', 'DT_Period']
-        self.floaters = ['Scheduled Shrinkage (%)', 'Unscheduled Shrinkage (%)', 'Total Shrinkage (%)', 'CST (%)',
-                         'core_wlh', 'sch_shrnk_hrs', 'unsch_shrnk_hrs', 'cst_hrs']
+# ----------------------------------------------------------------------------------------------------
+# Initialize
+# ----------------------------------------------------------------------------------------------------
+class DataCleaner:
+    key_columns: List[str] = [
+        "Core_Groups",
+        "Groups",
+        "Sub_Groups",
+        "Value_Type",
+        "Reporting_Period",
+        "DT_Period",
+    ]
+
+    float_columns: List[str] = [
+        "Scheduled Shrinkage (%)",
+        "Unscheduled Shrinkage (%)",
+        "Total Shrinkage (%)",
+        "CST (%)",
+        "core_wlh",
+        "sch_shrnk_hrs",
+        "unsch_shrnk_hrs",
+        "cst_hrs",
+    ]
 
 
-    def process_data(self, region, data):
-        self.prepare_df(data)
-        self.calculate_values()
-        return self.finalize_df(region)
-    
+# ----------------------------------------------------------------------------------------------------
+# Pipeline
+# ----------------------------------------------------------------------------------------------------
+    def process_data(self, region: str, data: pd.DataFrame) -> Tuple[List[str], pd.DataFrame]:
+        df_prepared = self._prepare_df(data)
+        df_transformed = self._calculate_values(df_prepared)
+        return self._finalize_df(df_transformed, region)
 
-    def prepare_df(self, data):
+
+    # Prepare Data
+    def _prepare_df(self, data: pd.DataFrame) -> pd.DataFrame:
         df = data.copy()
+
+        # Clean column names
         df.columns = df.columns.str.strip()
-        obj_cols = df.select_dtypes('str').columns
-        df.loc[:, obj_cols] = df.loc[:, obj_cols].apply(lambda x: x.str.strip())
+        str_cols = df.select_dtypes(include="object").columns
+        df[str_cols] = df[str_cols].apply(lambda col: col.str.strip())
 
-        df['DT_Period'] = pd.to_datetime(df['Reporting_Period'], format="%b %y")
-        date_range = df.sort_values(by='DT_Period', ascending=True)['DT_Period'].unique()[-12:]
-        df = df[df['DT_Period'].isin(date_range)]
+        df["DT_Period"] = pd.to_datetime(df["Reporting_Period"], format="%b %y")
 
-        self.df_pivot = df.pivot_table(index=self.key_columns, columns='Measure_Names', values='Measure_Values', sort=False).reset_index()
-        self.df_pivot.columns.name = None
+        # Use only recent 12 months
+        latest_periods = (df.sort_values("DT_Period")["DT_Period"].drop_duplicates().tail(12))
+        df = df[df["DT_Period"].isin(latest_periods)]
 
-
-    def calculate_values(self):
-        self.df_pivot['core_wlh'] = self.df_pivot['Total Workload (hrs)'] / self.df_pivot['Workload FTE'] * self.df_pivot['Core']
-        self.df_pivot['sch_shrnk_hrs'] = self.df_pivot['core_wlh'] * self.df_pivot['Scheduled Shrinkage (%)']
-        self.df_pivot['unsch_shrnk_hrs'] = self.df_pivot['core_wlh'] * self.df_pivot['Unscheduled Shrinkage (%)']
-        self.df_pivot['cst_hrs'] = self.df_pivot['core_wlh'] - (self.df_pivot['sch_shrnk_hrs'] + self.df_pivot['unsch_shrnk_hrs'])
-
-        self.df_pivot['Net Resource Share'] = self.df_pivot['Resource Share In'] + (self.df_pivot['Resource Share Out'] * (-1))
-
-        self.df_pivot['Sub_Groups'] = self.df_pivot['Sub_Groups'].apply(lambda x: x.removesuffix(' (Bilingual)') if 'Bilingual' in x else x)
-        self.df_pivot = self.df_pivot.groupby(self.key_columns, as_index=False).sum(numeric_only=True)
-
-        self.df_pivot['Scheduled Shrinkage (%)'] = self.df_pivot['sch_shrnk_hrs'] / self.df_pivot['core_wlh']
-        self.df_pivot['Unscheduled Shrinkage (%)'] = self.df_pivot['unsch_shrnk_hrs'] / self.df_pivot['core_wlh']
-        self.df_pivot['Total Shrinkage (%)'] = self.df_pivot['Scheduled Shrinkage (%)'] + self.df_pivot['Unscheduled Shrinkage (%)']
-        self.df_pivot['CST (%)'] - self.df_pivot['cst_hrs'] / self.df_pivot['core_wlh']
+        df_pivot = (df.pivot_table(index=self.key_columns,columns="Measure_Names",values="Measure_Values",sort=False,).reset_index())
+        df_pivot.columns.name = None
+        return df_pivot
 
 
-    def finalize_df(self, region):
-        df_unpiv = self.df_pivot.melt(id_vars=self.key_columns, var_name='Measure_Names', value_name='Measure_Values')
+    # Perform calculations and adjustments
+    def _calculate_values(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
 
-        if region == 'Foreign':
-            new_df = df_unpiv.groupby(['Groups', 'Measure_Names', 'Value_Type', 'Reporting_Period', 'DT_Period'], as_index=False)['Measure_Values'].sum()
-            group_list = sorted(new_df['Groups'].unique().tolist())
+        # shrink/cst hours
+        df["core_wlh"] = (df["Total Workload (hrs)"] / df["Workload FTE"] * df["Core"])
+        df["sch_shrnk_hrs"] = df["core_wlh"] * df["Scheduled Shrinkage (%)"]
+        df["unsch_shrnk_hrs"] = df["core_wlh"] * df["Unscheduled Shrinkage (%)"]
+        df["cst_hrs"] = df["core_wlh"] - (df["sch_shrnk_hrs"] + df["unsch_shrnk_hrs"])
+
+        # net resource share
+        df["Net Resource Share"] = (df["Resource Share In"] - df["Resource Share Out"])
+
+        # clean subgroup names
+        df["Sub_Groups"] = df["Sub_Groups"].str.replace(r"\s*\(Bilingual\)", "", regex=True)
+
+        # aggregate
+        df = df.groupby(self.key_columns, as_index=False).sum(numeric_only=True)
+
+        # shrink/cst percentages
+        df["Scheduled Shrinkage (%)"] = df["sch_shrnk_hrs"] / df["core_wlh"]
+        df["Unscheduled Shrinkage (%)"] = df["unsch_shrnk_hrs"] / df["core_wlh"]
+        df["Total Shrinkage (%)"] = (df["Scheduled Shrinkage (%)"] + df["Unscheduled Shrinkage (%)"])
+        df["CST (%)"] = df["cst_hrs"] / df["core_wlh"]
+
+        return df
+
+
+    # Finalize output
+    def _finalize_df(self, df: pd.DataFrame, region: str) -> Tuple[List[str], pd.DataFrame]:
+
+        df_unpivot = df.melt(id_vars=self.key_columns,var_name="Measure_Names",value_name="Measure_Values",)
+
+        # region-based grouping
+        if region == "Foreign":
+            group_col = "Groups"
         else:
-            new_df = df_unpiv.groupby(['Sub_Groups', 'Measure_Names', 'Value_Type', 'Reporting_Period', 'DT_Period'], as_index=False)['Measure_Values'].sum()
-            group_list = sorted(new_df['Sub_Groups'].unique().tolist())
+            group_col = "Sub_Groups"
 
-        new_df.sort_values(by='DT_Period', ascending=True, inplace=True)
-        new_df.reset_index(drop=True, inplace=True)
+        grouped = (df_unpivot.groupby([group_col, "Measure_Names", "Value_Type", "Reporting_Period", "DT_Period"],as_index=False,)["Measure_Values"].sum())
+        group_list = sorted(grouped[group_col].unique())
+        grouped = grouped.sort_values("DT_Period").reset_index(drop=True)
 
-        non_floaters = ~new_df['Measure_Names'].isin(self.floaters)
-        new_df.loc[non_floaters, 'Measure_Values'] = new_df.loc[non_floaters, 'Measure_Values'].round().astype(int)
+        # format numeric values
+        mask = ~grouped["Measure_Names"].isin(self.float_columns)
+        grouped.loc[mask, "Measure_Values"] = (grouped.loc[mask, "Measure_Values"].round().astype("Int64"))
 
-        if region == 'Local':
-            self.set_vars(new_df)
+        # optional metadata
+        if region == "Local":
+            self._set_metadata(grouped)
 
-        return group_list, new_df
-    
+        return group_list, grouped
 
-    def set_vars(self, data):
-        self.min_historical = data[data['Value_Type'] == 'Historical']['DT_Period'].unique().min()
-        self.max_historical = data[data['Value_Type'] == 'Historical']['DT_Period'].unique().max()
-        self.min_forecast = data[data['Value_Type'] == 'Forecast']['DT_Period'].unique().min()
-        self.min_forecast = data[data['Value_Type'] == 'Forecast']['DT_Period'].unique().max()
-        forecast_start = data[data['DT_Period'] == self.min_forecast]['Reporting_Period'].unique()
-        self.forecast_start_index = data['Reporting_Period'].unique().tolist().index(forecast_start)
+
+    # metadata
+    def _set_metadata(self, df: pd.DataFrame) -> None:
+        historical = df[df["Value_Type"] == "Historical"]
+        forecast = df[df["Value_Type"] == "Forecast"]
+
+        self.min_historical = historical["DT_Period"].min()
+        self.max_historical = historical["DT_Period"].max()
+
+        self.min_forecast = forecast["DT_Period"].min()
+        self.max_forecast = forecast["DT_Period"].max()
+
+        forecast_start_period = (df.loc[df["DT_Period"] == self.min_forecast, "Reporting_Period"].iloc[0])
+        self.forecast_start_index = (df["Reporting_Period"].drop_duplicates().tolist().index(forecast_start_period))
